@@ -1,0 +1,506 @@
+require 'fileutils'
+require File.dirname(__FILE__) + '/core_ext'
+require File.dirname(__FILE__) + '/java_file_timestamp_checker'
+require File.dirname(__FILE__) + '/subversion_utils'
+
+class JavaBuilder
+    include FileUtils
+    include Shell
+
+    attr_accessor :java_src_dir
+
+    def initialize(java_src_dir,jdk_home=nil)
+        @java_src_dir = java_src_dir
+        @jdk_home = jdk_home || ''
+        @java_file_timestamp_checker = JavaFileTimestampChecker.new :jar_command=> jdk_command(:jar),:verbose=>false
+    end
+
+    def jdk_command(command)
+        if @jdk_home.nil? || @jdk_home.empty?
+            command.to_s
+        else
+            result = "#{@jdk_home}/bin/#{command.to_s}"
+            result = result.gsub("/","\\") if win32?
+            result
+        end
+    end
+
+    RESOURCE_PATTERN = ['.properties','.xml','.gif', '.png', '.jpeg', '.jpg','.html',
+    '.dtd', '*.tld','.jrxml','.jasper','.tif','.wav','.exe']
+
+    def javac params
+        params.assert_valid_keys(:module, :lib, :dependent_module, :resouce_pattern, :verbose)
+
+        lib = params[:lib] || []
+        dependent_module = params[:dependent_module] || []
+        resouce_pattern = params[:resouce_pattern] || RESOURCE_PATTERN
+
+        verbose = params[:verbose] || false
+
+        dependencies = get_classpath(lib, dependent_module)
+
+        [params[:module]].flatten.collect {|name| @java_src_dir + '/' + name}.each {|module_dir|
+            compile_single_module(module_dir + '/src', module_dir + '/classes',
+            dependencies, resouce_pattern, verbose)
+            compile_single_module(module_dir + '/test', module_dir + '/testclasses',
+            dependencies << (module_dir +'/classes'), resouce_pattern, verbose)
+        }
+    end
+
+    def get_classpath(lib, dependent_module, classes=true)
+        result = [lib].flatten.collect {|dir| (dir.include?".jar")? Dir["#{@java_src_dir}/#{dir}"] : Dir["#{@java_src_dir}/#{dir}/**/*.jar"]}.flatten
+
+        if classes
+            result = result + [dependent_module].flatten.collect{|dir| "#{@java_src_dir}/#{dir}/classes"}
+        else
+            result = result.collect {|jar_file| File.basename(jar_file)} + [dependent_module].flatten.collect{|dir| "#{dir}.jar" }
+        end
+
+        result
+    end
+
+    def junit params
+        params.assert_valid_keys(:module, :java_module_dependency_rules, :verbose)
+
+        module_dir = params[:module]
+        dependencies = get_transitive_dependencies(module_dir, params[:java_module_dependency_rules])
+        verbose = params[:verbose] || false
+
+        lib = []
+        dependent_module =[]
+        analyze_dependencies(lib,dependent_module,dependencies)
+
+        classpath = get_classpath(lib, dependent_module)
+
+        classpath << (@java_src_dir+'/'+module_dir+'/classes') << (@java_src_dir+ '/'+ module_dir+'/testclasses')
+
+        classpath_option = "-classpath #{classpath.join(CLASSPATH_SEPARATOR)}" unless dependencies.empty?
+
+        test_path = "#{@java_src_dir}/#{module_dir}/testclasses"
+
+        puts "test_path=#{test_path}"
+        Dir["#{test_path}/**/*.class"].each do |file_name|
+            test_class = file_name[test_path.length+1,
+            file_name.length - test_path.length - '.class'.length-1].gsub('/','.')
+            if test_class =~ /\.Test[^.]*$/
+                cmd = "#{jdk_command(:java)} #{classpath_option} junit.textui.TestRunner #{test_class}"
+                puts cmd if verbose
+                system cmd
+            end
+        end
+    end
+
+    def compile_single_module(source, destination, dependencies, resource_pattern, verbose)
+        java_files = get_out_of_date_java_files(source, destination, dependencies)
+
+        phantom_files = get_phantom_class_files(source, destination)+
+        get_phantom_resource_files(source, destination, resource_pattern)
+        rm phantom_files unless phantom_files.empty?
+
+        classpath = "#{dependencies.join(CLASSPATH_SEPARATOR)}" unless dependencies.empty?       
+        
+        cmd = "#{jdk_command(:javac)} -encoding utf8 -sourcepath #{source} -d #{destination} #{java_files.join(' ')}".squeeze(' ')
+
+        puts cmd if verbose && !java_files.empty?
+
+        unless java_files.empty?
+            mkdir_p destination
+            ENV['CLASSPATH']=classpath
+            system cmd
+        end
+
+        unless resource_pattern.empty?
+            copy_resource_files(source, destination, resource_pattern)
+        end
+    end
+
+    def get_out_of_date_java_files(src_dir, dest_dir, dependencies)
+        @java_file_timestamp_checker.get_out_of_date_java_files(src_dir, dest_dir, dependencies)
+    end
+
+    def copy_resource_files(java_src_dir, java_class_dir, pattern)
+        get_out_of_date_resource_files(java_src_dir, java_class_dir, pattern).each do |filename|
+            dest = File.dirname(filename).sub(java_src_dir, java_class_dir)
+            mkdir_p dest
+            cp filename,dest
+        end
+    end
+
+    def jar_module params
+        params.assert_valid_keys(:dest_dir, :module, :main_class, :dependencies,:verbose)
+
+        dest_dir = params[:dest_dir]
+        module_dir = @java_src_dir + '/' + params[:module]
+        dest = File.basename(module_dir)
+        dependencies = params[:dependencies] || []
+
+        lib = []
+        dependent_module =[]
+        analyze_dependencies(lib, dependent_module, dependencies)
+
+        verbose = params[:verbose] || false
+        main_class = params[:main_class]
+
+        mkdir_p dest_dir
+
+        classpath = get_classpath(lib, dependent_module, false)
+
+        mkdir_p "#{module_dir}/classes"
+        
+        manifest_file = "#{module_dir}/classes/MANIFEST.MF"
+
+        revision = SubversionUtils::revision(module_dir)
+
+        create_manifest_file(manifest_file,classpath,main_class,revision,verbose)
+
+        jar_file = "#{dest_dir}/#{params[:module]}.jar"
+
+        if !File.exist?(jar_file) || (File.atime(jar_file) < get_lastest_atime("#{module_dir}/classes"))
+            jar :module=>params[:module],
+            :dest_dir=>dest_dir,
+            :src_dir=>"#{module_dir}/classes",
+            :manifest=>manifest_file,
+            :verbose=>verbose
+        else
+            puts "no change in #{File.basename(jar_file)}"
+        end
+
+    end
+
+    def create_manifest_file(filename, dependencies, main_class, revision, verbose)
+        content = <<EOF
+Manifest-Version: 1.0
+Main-Class: #{main_class}
+Class-Path: #{dependencies.uniq.join(' ').wrap(:width=>80,:wrapper=>"\n  ")}
+Created-By: rake
+Revision: #{revision}
+EOF
+        puts "----\n#{content}----\n" if verbose
+
+        if File.exist?(filename) && content.eql?(File.read(filename))
+            puts "no change in #{File.basename(filename)}"
+            return
+        end
+
+        File.open(filename,'w') do |f|
+            f.print(content)
+        end
+    end
+
+    def jar params
+        params.assert_valid_keys(:module, :dest_dir, :src_dir, :manifest, :ext, :verbose)
+
+        module_dir = @java_src_dir + '/' + params[:module]
+        dest_dir = params[:dest_dir] || module_dir
+        manifest = params[:manifest]
+
+        verbose = params[:verbose] || false
+
+        src_dir = params[:src_dir]
+
+        ext = params[:ext] || '.jar'
+
+        jar_file = dest_dir+'/'+File.basename(module_dir)+ ext
+
+        if manifest
+            cmd = "#{jdk_command(:jar)} -cfm #{jar_file} #{manifest} -C #{src_dir} ."
+        else
+            cmd = "#{jdk_command(:jar)} -cf #{jar_file} -C #{src_dir} ."
+        end
+
+        puts cmd if verbose
+
+        system cmd
+    end
+
+    def get_phantom_class_files(src_dir, dest_dir)
+        phantom_classes = []
+        Dir["#{dest_dir}/**/*.class"].each do |class_file|
+            java_file = src_dir + class_file[dest_dir.length,
+            class_file.length - dest_dir.length - '.class'.length] + '.java'
+
+            phantom_classes << class_file unless File.exist?(java_file) ||
+            File.exist?(remove_anonymous_class_indicator(java_file))
+        end
+
+        phantom_classes
+    end
+
+    def remove_anonymous_class_indicator filename
+        filename.sub(/\$.+\./,'.')
+    end
+
+    def get_out_of_date_resource_files(java_src_dir, java_class_dir, pattern)
+        resource_files = []
+        [pattern].flatten.each do |p|
+            Dir[java_src_dir + "/**/*#{p}"].each do |src_file|
+                dest_file = src_file.sub(java_src_dir,java_class_dir)
+
+                unless File.exist?(dest_file) && File.atime(dest_file) > File.atime(src_file)
+                    resource_files << src_file
+                end
+            end
+        end
+        resource_files
+    end
+
+    def get_phantom_resource_files(java_src_dir, java_class_dir, pattern)
+        phantom_resources = []
+
+        [pattern].flatten.each do |p|
+            Dir[java_class_dir + "/**/*#{p}"].each do |dest_file|
+                src_file = dest_file.sub(java_class_dir, java_src_dir)
+                phantom_resources << dest_file unless File.exist?(src_file)
+            end
+        end
+        phantom_resources
+    end
+
+    def get_lastest_atime dir
+        Dir["#{dir}/**/*"].inject(Time.at(0)) { |result,filename|
+            result>File.atime(filename)? result : File.atime(filename)
+        }
+    end
+
+    def analyze_dependencies(lib, dependent_module, dependencies)
+        dependencies = [dependencies].flatten
+
+        dependencies.each do |name|
+            if name=~/lib\//
+                lib << name
+            else
+                dependent_module << name
+            end
+        end
+    end
+
+    def get_javac_task(module_name)
+        module_name.to_task(:compile)
+    end
+
+    def get_jar_task(module_name)
+        module_name.to_task(:jar)
+    end
+
+    def get_junit_task(module_name)
+        module_name.to_task(:test)
+    end
+
+    def get_transitive_dependencies module_name, rules
+        result = []
+        calculate_transitive_dependencies result, module_name, rules
+        result
+    end
+
+    def calculate_transitive_dependencies result, module_name, rules
+        return if rules[module_name].nil?
+
+        dependencies = rules[module_name] - result
+
+        return if dependencies.empty?
+
+        result.push(*dependencies)
+
+        dependencies.each do |name|
+            calculate_transitive_dependencies(result, name, rules)
+        end
+    end
+    
+    def get_revision module_dir
+       SubversionUtils::revision(module_dir)
+    end
+end
+
+def define_javac_task params
+    params.assert_valid_keys(:java_builder, :module, :dependencies, :verbose)
+
+    java_builder = params[:java_builder]
+    module_name = params[:module]
+    dependencies= params[:dependencies] || []
+    verbose = params[:verbose] || false
+
+    lib = []
+    dependent_module = []
+
+    java_builder.analyze_dependencies(lib, dependent_module, dependencies)
+
+    task module_name.to_task(:compile) => dependent_module.collect{|name| name.to_task(:compile)} do
+        java_builder.javac :module=>module_name,
+        :lib=>lib,
+        :dependent_module=>dependent_module,
+        :verbose=>verbose
+    end
+end
+
+def define_javac_tasks params
+    params.assert_valid_keys(:java_builder, :java_module_dependency_rules, :verbose)
+
+    java_builder = params[:java_builder]
+    java_module_dependency_rules = params[:java_module_dependency_rules]
+    verbose = params[:verbose] || false
+
+    lib = []
+    modules = []
+    java_builder.analyze_dependencies(lib, modules,
+    java_module_dependency_rules.to_a.flatten.uniq)
+
+    modules.each {|module_name|
+        define_javac_task :java_builder=>java_builder,
+        :module=>module_name,
+        :dependencies=>java_builder.get_transitive_dependencies(module_name,java_module_dependency_rules),
+        :verbose=>verbose
+    }
+end
+
+def define_jar_module_task params
+    params.assert_valid_keys(:java_builder,
+    :main_class, :module, :java_module_dependency_rules, :verbose)
+
+    java_builder = params[:java_builder]
+    main_class = params[:main_class]
+    module_name = params[:module]
+    java_module_dependency_rules = params[:java_module_dependency_rules] || []
+    verbose = params[:verbose] || false
+
+    jar_file = "#{java_builder.java_src_dir}/#{module_name}/#{module_name}.jar"
+    file jar_file => module_name.to_task(:compile) do
+        java_builder.jar_module :dest_dir=> (java_builder.java_src_dir + '/' + module_name),
+        :module=>module_name,
+        :dependencies=> java_builder.get_transitive_dependencies(module_name,java_module_dependency_rules),
+        :verbose=>verbose
+    end
+    task module_name.to_task(:jar) => jar_file
+
+    module_name.to_task(:jar)
+end
+
+def define_jar_task params
+    params.assert_valid_keys(:java_builder, :dest_dir,
+    :main_class, :module, :java_module_dependency_rules, :excluded, :verbose)
+
+    java_builder = params[:java_builder]
+    dest_dir = params[:dest_dir]
+    main_class = params[:main_class]
+    module_name = params[:module]
+    java_module_dependency_rules = params[:java_module_dependency_rules] || []
+    excluded = params[:excluded] || []
+    verbose = params[:verbose] || false
+
+    lib = []
+    dependent_module = []
+    java_builder.analyze_dependencies(lib, dependent_module,
+    java_builder.get_transitive_dependencies(module_name,java_module_dependency_rules))
+    lib = lib - excluded
+    dependent_module = dependent_module - excluded
+
+    result = dest_dir + '/' + module_name + '.jar'
+    task module_name.gsub('-','_').to_sym => result
+
+    jar_dependencies = []
+    dependent_module.each do |name|
+        jar_dependencies <<  define_jar_module_task(:java_builder=>java_builder,
+        :module=>name,
+        :java_module_dependency_rules=>java_module_dependency_rules,
+        :verbose=>verbose)
+    end
+
+    file result => [module_name.to_task(:compile),jar_dependencies].flatten do
+        mkdir_p dest_dir
+
+        lib.each {|dir|
+            ((dir.include?".jar")? Dir[java_builder.java_src_dir + '/' + dir] : Dir[java_builder.java_src_dir + '/' + dir + '/**/*.jar']).each { |file|
+                cp file, dest_dir
+            }
+        }
+
+        dependent_module.each {|name|
+            jar_file = "#{java_builder.java_src_dir}/#{name}/#{name}.jar"
+            cp jar_file, dest_dir
+        }
+
+        java_builder.jar_module :dest_dir=> dest_dir,
+        :module=>module_name,
+        :main_class=>main_class,
+        :dependencies=>java_builder.get_transitive_dependencies(module_name,java_module_dependency_rules),
+        :verbose=>verbose
+    end
+end
+
+def define_package_task params
+    params.assert_valid_keys(:java_builder, :dest_dir, :module,
+    :java_module_dependency_rules, :excluded, :ext, :verbose)
+    java_builder = params[:java_builder]
+    dest_dir = params[:dest_dir]
+    module_name = params[:module]
+    java_module_dependency_rules = params[:java_module_dependency_rules] || []
+    excluded = params[:excluded] || []
+    ext = params[:ext]
+
+    verbose = params[:verbose] || false
+
+    tmp_dir = dest_dir + "/#{module_name}"
+
+    result = dest_dir + '/' + module_name + ext
+
+    dependencies =
+    java_builder.get_transitive_dependencies(module_name,java_module_dependency_rules)
+
+    lib = []
+    dependent_module = []
+    java_builder.analyze_dependencies(lib, dependent_module, dependencies)
+
+    lib = lib - excluded
+
+    task module_name.gsub('-','_').to_sym => result
+
+    jar_dependencies = []
+    dependent_module.each do |name|
+        jar_dependencies <<  define_jar_module_task(:java_builder=>java_builder,
+        :module=>name,
+        :java_module_dependency_rules=>java_module_dependency_rules,
+        :verbose=>verbose)
+    end
+
+    file result => jar_dependencies do
+        mkdir_p dest_dir
+        mkdir_p tmp_dir
+
+        manifest_file = tmp_dir + '/MANIFEST.MF'
+        module_dir = java_builder.java_src_dir + '/' + module_name
+
+        revision = SubversionUtils::revision(module_dir)
+
+        java_builder.create_manifest_file(manifest_file,[],"",revision,verbose)
+
+        java_builder.jar :module=>module_name,
+        :dest_dir=>dest_dir,
+        :src_dir=>tmp_dir,
+        :manifest=>manifest_file,
+        :ext=>ext,
+        :verbose=>verbose
+
+        rm_rf tmp_dir
+    end
+
+end
+
+def define_junit_tasks params
+    params.assert_valid_keys(:java_builder, :java_module_dependency_rules, :verbose)
+
+    java_builder = params[:java_builder]
+    java_module_dependency_rules = params[:java_module_dependency_rules]
+    verbose = params[:verbose] || false
+
+    lib = []
+    modules = []
+    java_builder.analyze_dependencies(lib, modules,
+    java_module_dependency_rules.to_a.flatten.uniq)
+
+    modules.each {|module_name|
+        task module_name.to_task(:test) =>module_name.to_task(:compile) do
+            java_builder.junit :module=>module_name,
+            :java_module_dependency_rules=>java_module_dependency_rules,
+            :verbose=>verbose
+        end
+    }
+end
